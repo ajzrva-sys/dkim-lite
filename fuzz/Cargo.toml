@@ -1,0 +1,32 @@
+[package]
+name = "dkim-lite-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.10"
+
+[dependencies.dkim-lite]
+path = ".."
+
+[[bin]]
+name = "milter_frame"
+path = "fuzz_targets/milter_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "header"
+path = "fuzz_targets/header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "body"
+path = "fuzz_targets/body.rs"
+test = false
+doc = false

@@ -1,0 +1,15 @@
+policy_module(dkim_lite, 1.0.0)
+
+type dkim_lite_var_run_t;
+files_pid_file(dkim_lite_var_run_t)
+
+# Postfix cleanup(8) is the milter client for locally submitted mail.
+gen_require(`
+    type postfix_cleanup_t;
+    type postfix_smtpd_t;
+    type unconfined_service_t;
+')
+allow postfix_cleanup_t dkim_lite_var_run_t:sock_file write;
+allow postfix_cleanup_t unconfined_service_t:unix_stream_socket connectto;
+allow postfix_smtpd_t dkim_lite_var_run_t:sock_file write;
+allow postfix_smtpd_t unconfined_service_t:unix_stream_socket connectto;

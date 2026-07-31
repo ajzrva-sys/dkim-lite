@@ -1,0 +1,8 @@
+/target/
+/dist/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
+*.rpm
+*.src.rpm
+**/__pycache__/

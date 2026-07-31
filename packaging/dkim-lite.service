@@ -1,0 +1,38 @@
+[Unit]
+Description=Lite outgoing DKIM signer
+After=network.target
+Before=postfix.service
+
+[Service]
+Type=simple
+User=dkim-lite
+# The process remains user dkim-lite (and can read a 0600 key it owns), while
+# the Unix socket is created with Postfix's group so Postfix can connect.
+Group=postfix
+RuntimeDirectory=dkim-lite
+RuntimeDirectoryMode=0750
+UMask=0007
+ExecStart=/usr/sbin/dkim-lite --config /etc/dkim-lite/dkim-lite.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadOnlyPaths=/etc/dkim-lite
+ReadWritePaths=/run/dkim-lite
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

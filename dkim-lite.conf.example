@@ -1,0 +1,9 @@
+# dkim-lite signs only messages whose single From domain equals this value.
+domain=example.com
+selector=mail2026
+private_key=/etc/dkim-lite/mail2026.pem
+listen=unix:/run/dkim-lite/dkim.sock
+require_fips=true
+
+# For a loopback TCP listener, replace listen with:
+# listen=tcp:127.0.0.1:8891

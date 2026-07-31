@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --all-targets --locked --offline -- -D warnings
+      - name: Test
+        run: cargo test --all-targets --locked --offline
+      - name: Build release binary
+        run: cargo build --release --locked --offline
+      - name: Verify deterministic production archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          first="$(mktemp -d)"
+          second="$(mktemp -d)"
+          trap 'rm -rf "$first" "$second"' EXIT
+          packaging/make-source.sh 0.1.0 "$first" >/dev/null
+          packaging/make-source.sh 0.1.0 "$second" >/dev/null
+          cmp "$first/dkim-lite-0.1.0.tar.gz" "$second/dkim-lite-0.1.0.tar.gz"
