@@ -70,36 +70,63 @@ impl Default for BodyCanonicalizer {
 }
 
 impl BodyCanonicalizer {
-    pub fn update(&mut self, data: &[u8]) {
-        for &byte in data {
+    pub fn update(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
             if self.saw_cr {
                 self.saw_cr = false;
                 self.end_line();
-                if byte == b'\n' {
+                if data[0] == b'\n' {
+                    data = &data[1..];
                     continue;
                 }
             }
-            match byte {
-                b'\r' => self.saw_cr = true,
-                b'\n' => self.end_line(),
-                b' ' | b'\t' => self.pending_wsp = true,
-                _ => {
-                    if !self.line_has_content && self.pending_empty_lines > 0 {
-                        for _ in 0..self.pending_empty_lines {
-                            self.hasher.update(b"\r\n");
-                        }
-                        self.pending_empty_lines = 0;
-                    }
-                    if self.pending_wsp {
-                        self.hasher.update(b" ");
-                        self.pending_wsp = false;
-                    }
-                    self.hasher.update(&[byte]);
-                    self.line_has_content = true;
-                    self.emitted_content = true;
+
+            let ordinary = data
+                .iter()
+                .position(|byte| matches!(*byte, b'\r' | b'\n' | b' ' | b'\t'))
+                .unwrap_or(data.len());
+            if ordinary > 0 {
+                self.emit_content(&data[..ordinary]);
+                data = &data[ordinary..];
+                continue;
+            }
+
+            match data[0] {
+                b'\r' => {
+                    self.saw_cr = true;
+                    data = &data[1..];
                 }
+                b'\n' => {
+                    self.end_line();
+                    data = &data[1..];
+                }
+                b' ' | b'\t' => {
+                    self.pending_wsp = true;
+                    let whitespace = data
+                        .iter()
+                        .position(|byte| !matches!(*byte, b' ' | b'\t'))
+                        .unwrap_or(data.len());
+                    data = &data[whitespace..];
+                }
+                _ => unreachable!(),
             }
         }
+    }
+
+    fn emit_content(&mut self, content: &[u8]) {
+        if !self.line_has_content && self.pending_empty_lines > 0 {
+            for _ in 0..self.pending_empty_lines {
+                self.hasher.update(b"\r\n");
+            }
+            self.pending_empty_lines = 0;
+        }
+        if self.pending_wsp {
+            self.hasher.update(b" ");
+            self.pending_wsp = false;
+        }
+        self.hasher.update(content);
+        self.line_has_content = true;
+        self.emitted_content = true;
     }
 
     fn end_line(&mut self) {
@@ -313,6 +340,88 @@ mod tests {
         base64::encode_block(&c.finish())
     }
 
+    fn reference_body(data: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        let mut pending_wsp = false;
+        let mut pending_empty_lines = 0usize;
+        let mut line_has_content = false;
+        let mut emitted_content = false;
+        let mut saw_cr = false;
+        let end_line = |hasher: &mut Sha256,
+                        pending_wsp: &mut bool,
+                        pending_empty_lines: &mut usize,
+                        line_has_content: &mut bool| {
+            *pending_wsp = false;
+            if *line_has_content {
+                hasher.update(b"\r\n");
+                *line_has_content = false;
+            } else {
+                *pending_empty_lines = pending_empty_lines.saturating_add(1);
+            }
+        };
+        for &byte in data {
+            if saw_cr {
+                saw_cr = false;
+                end_line(
+                    &mut hasher,
+                    &mut pending_wsp,
+                    &mut pending_empty_lines,
+                    &mut line_has_content,
+                );
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            match byte {
+                b'\r' => saw_cr = true,
+                b'\n' => end_line(
+                    &mut hasher,
+                    &mut pending_wsp,
+                    &mut pending_empty_lines,
+                    &mut line_has_content,
+                ),
+                b' ' | b'\t' => pending_wsp = true,
+                _ => {
+                    if !line_has_content && pending_empty_lines > 0 {
+                        for _ in 0..pending_empty_lines {
+                            hasher.update(b"\r\n");
+                        }
+                        pending_empty_lines = 0;
+                    }
+                    if pending_wsp {
+                        hasher.update(b" ");
+                        pending_wsp = false;
+                    }
+                    hasher.update(&[byte]);
+                    line_has_content = true;
+                    emitted_content = true;
+                }
+            }
+        }
+        if saw_cr {
+            end_line(
+                &mut hasher,
+                &mut pending_wsp,
+                &mut pending_empty_lines,
+                &mut line_has_content,
+            );
+        } else if line_has_content {
+            hasher.update(b"\r\n");
+        }
+        if !emitted_content {
+            hasher.update(b"\r\n");
+        }
+        hasher.finish()
+    }
+
+    fn optimized_body(parts: &[&[u8]]) -> [u8; 32] {
+        let mut canonicalizer = BodyCanonicalizer::default();
+        for part in parts {
+            canonicalizer.update(part);
+        }
+        canonicalizer.finish()
+    }
+
     #[test]
     fn relaxed_header() {
         assert_eq!(
@@ -357,6 +466,47 @@ mod tests {
     fn keeps_leading_empty_lines_before_content() {
         assert_eq!(body(&[b"\r\nA"]), body(&[b"\r", b"\n", b"A"]));
         assert_ne!(body(&[b"\r\nA"]), body(&[b"A"]));
+    }
+
+    #[test]
+    fn optimized_body_matches_reference_for_all_split_positions() {
+        let mut state = 0x6d5a_56e9_1234_5678u64;
+        let mut arbitrary = Vec::with_capacity(4096);
+        for _ in 0..4096 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let byte = match state & 15 {
+                0 => b'\r',
+                1 => b'\n',
+                2 | 3 => b' ',
+                4 => b'\t',
+                _ => (state >> 24) as u8,
+            };
+            arbitrary.push(byte);
+        }
+        let mut long_runs = vec![b' '; 2048];
+        long_runs.extend_from_slice(&vec![b'\n'; 2048]);
+        long_runs.extend_from_slice(&vec![b'x'; 4096]);
+
+        for data in [
+            b"".as_slice(),
+            b"\r\n\r\n".as_slice(),
+            b" C \r\nD \t E\r\n\r\n".as_slice(),
+            &[0xff, b' ', b'\r', b'\n', 0x80],
+            arbitrary.as_slice(),
+            long_runs.as_slice(),
+        ] {
+            let expected = reference_body(data);
+            assert_eq!(optimized_body(&[data]), expected);
+            for split in 0..=data.len() {
+                assert_eq!(optimized_body(&[&data[..split], &data[split..]]), expected);
+            }
+            for chunk_size in 1..=64 {
+                let chunks: Vec<&[u8]> = data.chunks(chunk_size).collect();
+                assert_eq!(optimized_body(&chunks), expected);
+            }
+        }
     }
 
     #[test]

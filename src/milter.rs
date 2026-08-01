@@ -4,6 +4,8 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -17,6 +19,24 @@ const MAX_HEADER_BYTES: usize = 1024 * 1024;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 const ACTION_ADD_HEADER: u32 = 0x0000_0001;
 const ACTION_CHANGE_HEADER: u32 = 0x0000_0010;
+const PROTOCOL_NR_HEADER: u32 = 0x0000_0080;
+const PROTOCOL_NR_CONNECT: u32 = 0x0000_1000;
+const PROTOCOL_NR_HELO: u32 = 0x0000_2000;
+const PROTOCOL_NR_MAIL: u32 = 0x0000_4000;
+const PROTOCOL_NR_RCPT: u32 = 0x0000_8000;
+const PROTOCOL_NR_DATA: u32 = 0x0001_0000;
+const PROTOCOL_NR_UNKNOWN: u32 = 0x0002_0000;
+const PROTOCOL_NR_EOH: u32 = 0x0004_0000;
+const PROTOCOL_NR_BODY: u32 = 0x0008_0000;
+const SUPPORTED_NO_REPLY: u32 = PROTOCOL_NR_HEADER
+    | PROTOCOL_NR_CONNECT
+    | PROTOCOL_NR_HELO
+    | PROTOCOL_NR_MAIL
+    | PROTOCOL_NR_RCPT
+    | PROTOCOL_NR_DATA
+    | PROTOCOL_NR_UNKNOWN
+    | PROTOCOL_NR_EOH
+    | PROTOCOL_NR_BODY;
 
 #[derive(Default)]
 struct MessageState {
@@ -132,17 +152,33 @@ pub fn serve(
         }));
     }
 
-    while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-        match listener.accept() {
-            Ok(connection) => {
-                if sender.try_send(connection).is_err() {
-                    eprintln!("dkim-lite: worker queue full; dropping milter connection");
+    'accept: while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        if !listener
+            .wait_readable(Duration::from_millis(100))
+            .map_err(|error| format!("listener readiness failed: {error}"))?
+        {
+            continue;
+        }
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        loop {
+            match listener.accept() {
+                Ok(connection) => {
+                    if sender.try_send(connection).is_err() {
+                        eprintln!("dkim-lite: worker queue full; dropping milter connection");
+                    }
+                    if !listener
+                        .wait_readable(Duration::ZERO)
+                        .map_err(|error| format!("listener readiness failed: {error}"))?
+                    {
+                        break;
+                    }
                 }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) if shutdown.load(std::sync::atomic::Ordering::Relaxed) => break 'accept,
+                Err(error) => return Err(format!("listener failed: {error}")),
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(100));
-            }
-            Err(error) => return Err(format!("listener failed: {error}")),
         }
     }
     drop(sender);
@@ -221,6 +257,39 @@ impl Listener {
             }),
         }
     }
+
+    #[cfg(unix)]
+    fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
+        let fd = match self {
+            Self::Tcp(listener) => listener.as_raw_fd(),
+            Self::Unix(listener) => listener.as_raw_fd(),
+        };
+        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+            if result > 0 {
+                return Ok(descriptor.revents & libc::POLLIN != 0);
+            }
+            if result == 0 {
+                return Ok(false);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
+        thread::sleep(timeout);
+        Ok(true)
+    }
 }
 
 fn handle_connection(
@@ -229,16 +298,20 @@ fn handle_connection(
 ) -> Result<(), String> {
     let mut state = MessageState::default();
     let mut actions = 0u32;
+    let mut protocol = 0u32;
+    // One fixed-capacity packet buffer per active connection avoids allocator
+    // churn while keeping the 32-worker retained-memory ceiling at 32 MiB.
+    let mut packet = Vec::with_capacity(MAX_PACKET);
     let deadline = Instant::now() + CONNECTION_TIMEOUT;
     loop {
         if Instant::now() >= deadline {
             return Err("milter connection lifetime exceeded".to_owned());
         }
-        let packet = match read_packet(&mut stream) {
-            Ok(Some(packet)) => packet,
+        match read_packet_into(&mut stream, &mut packet) {
+            Ok(Some(())) => {}
             Ok(None) => return Ok(()),
             Err(error) => return Err(error.to_string()),
-        };
+        }
         let (&command, payload) = packet
             .split_first()
             .ok_or_else(|| "empty milter packet".to_owned())?;
@@ -250,10 +323,16 @@ fn handle_connection(
                 let version = u32::from_be_bytes(payload[0..4].try_into().unwrap()).min(6);
                 let offered = u32::from_be_bytes(payload[4..8].try_into().unwrap());
                 actions = offered & (ACTION_ADD_HEADER | ACTION_CHANGE_HEADER);
+                let offered_protocol = u32::from_be_bytes(payload[8..12].try_into().unwrap());
+                protocol = if version >= 6 {
+                    offered_protocol & SUPPORTED_NO_REPLY
+                } else {
+                    0
+                };
                 let mut response = Vec::with_capacity(12);
                 response.extend_from_slice(&version.to_be_bytes());
                 response.extend_from_slice(&actions.to_be_bytes());
-                response.extend_from_slice(&0u32.to_be_bytes());
+                response.extend_from_slice(&protocol.to_be_bytes());
                 write_packet(&mut stream, b'O', &response)?;
             }
             b'M' => {
@@ -262,7 +341,7 @@ fn handle_connection(
                     .map_err(|_| "configuration lock poisoned")?
                     .clone();
                 state.begin(config);
-                write_status(&mut stream, b'c')?;
+                write_continue_if_needed(&mut stream, protocol, b'M')?;
             }
             b'L' => {
                 if state.config.is_none() {
@@ -273,7 +352,7 @@ fn handle_connection(
                     state.begin(config);
                 }
                 receive_header(&mut state, payload);
-                write_status(&mut stream, b'c')?;
+                write_continue_if_needed(&mut stream, protocol, b'L')?;
             }
             b'B' => {
                 if state.config.is_none() {
@@ -281,7 +360,7 @@ fn handle_connection(
                 } else if state.error.is_none() {
                     state.body.update(payload);
                 }
-                write_status(&mut stream, b'c')?;
+                write_continue_if_needed(&mut stream, protocol, b'B')?;
             }
             b'E' => {
                 finish_message(&mut stream, &mut state, actions)?;
@@ -295,8 +374,8 @@ fn handle_connection(
                 // Macro definition packets are attached to the following command and
                 // never receive their own response.
             }
-            b'C' | b'H' | b'R' | b'T' | b'N' | b'U' => {
-                write_status(&mut stream, b'c')?;
+            command @ (b'C' | b'H' | b'R' | b'T' | b'N' | b'U') => {
+                write_continue_if_needed(&mut stream, protocol, command)?;
             }
             _ => return Err(format!("unsupported milter command 0x{command:02x}")),
         }
@@ -375,7 +454,7 @@ fn finish_message(
     write_status(stream, b'a')
 }
 
-fn read_packet(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+fn read_packet_into(stream: &mut impl Read, packet: &mut Vec<u8>) -> io::Result<Option<()>> {
     let mut length = [0u8; 4];
     match stream.read_exact(&mut length) {
         Ok(()) => {}
@@ -389,19 +468,55 @@ fn read_packet(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
             "invalid milter packet length",
         ));
     }
-    let mut packet = vec![0; length];
-    stream.read_exact(&mut packet)?;
-    Ok(Some(packet))
+    packet.resize(length, 0);
+    stream.read_exact(packet.as_mut_slice())?;
+    Ok(Some(()))
+}
+
+#[cfg(test)]
+fn read_packet(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+    let mut packet = Vec::new();
+    Ok(read_packet_into(stream, &mut packet)?.map(|()| packet))
 }
 
 /// Entry point used by the separately packaged fuzz harness.
 #[doc(hidden)]
 pub fn fuzz_milter_frame(data: &[u8]) {
-    let _ = read_packet(&mut io::Cursor::new(data));
+    let mut packet = Vec::new();
+    let _ = read_packet_into(&mut io::Cursor::new(data), &mut packet);
+}
+
+fn no_reply_flag(command: u8) -> u32 {
+    match command {
+        b'C' => PROTOCOL_NR_CONNECT,
+        b'H' => PROTOCOL_NR_HELO,
+        b'M' => PROTOCOL_NR_MAIL,
+        b'R' => PROTOCOL_NR_RCPT,
+        b'T' => PROTOCOL_NR_DATA,
+        b'U' => PROTOCOL_NR_UNKNOWN,
+        b'L' => PROTOCOL_NR_HEADER,
+        b'N' => PROTOCOL_NR_EOH,
+        b'B' => PROTOCOL_NR_BODY,
+        _ => 0,
+    }
+}
+
+fn write_continue_if_needed(
+    stream: &mut impl Write,
+    protocol: u32,
+    command: u8,
+) -> Result<(), String> {
+    if protocol & no_reply_flag(command) == 0 {
+        write_status(stream, b'c')?;
+    }
+    Ok(())
 }
 
 fn write_status(stream: &mut impl Write, status: u8) -> Result<(), String> {
-    write_packet(stream, status, &[])
+    stream
+        .write_all(&[0, 0, 0, 1, status])
+        .and_then(|_| stream.flush())
+        .map_err(|e| format!("cannot write milter response: {e}"))
 }
 
 fn write_packet(stream: &mut impl Write, command: u8, payload: &[u8]) -> Result<(), String> {
@@ -409,10 +524,12 @@ fn write_packet(stream: &mut impl Write, command: u8, payload: &[u8]) -> Result<
         .checked_add(payload.len())
         .and_then(|length| u32::try_from(length).ok())
         .ok_or_else(|| "milter response is too large".to_owned())?;
+    let mut packet = Vec::with_capacity(payload.len() + 5);
+    packet.extend_from_slice(&length.to_be_bytes());
+    packet.push(command);
+    packet.extend_from_slice(payload);
     stream
-        .write_all(&length.to_be_bytes())
-        .and_then(|_| stream.write_all(&[command]))
-        .and_then(|_| stream.write_all(payload))
+        .write_all(&packet)
         .and_then(|_| stream.flush())
         .map_err(|e| format!("cannot write milter response: {e}"))
 }
@@ -426,6 +543,25 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
 
+    struct RecordingWriter {
+        bytes: Vec<u8>,
+        calls: usize,
+        limit: usize,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            let count = bytes.len().min(self.limit);
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn packet_reader_handles_partial_reads() {
         let bytes = [0, 0, 0, 4, b'B', 1, 2, 3];
@@ -434,6 +570,69 @@ mod tests {
             read_packet(&mut reader).unwrap().unwrap(),
             vec![b'B', 1, 2, 3]
         );
+    }
+
+    #[test]
+    fn packet_reader_reuses_bounded_buffer() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(MAX_PACKET as u32).to_be_bytes());
+        bytes.extend_from_slice(&vec![b'a'; MAX_PACKET]);
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.push(b'Q');
+        let mut reader = io::Cursor::new(bytes);
+        let mut packet = Vec::with_capacity(MAX_PACKET);
+        assert_eq!(
+            read_packet_into(&mut reader, &mut packet).unwrap(),
+            Some(())
+        );
+        let capacity = packet.capacity();
+        assert_eq!(packet.len(), MAX_PACKET);
+        assert_eq!(
+            read_packet_into(&mut reader, &mut packet).unwrap(),
+            Some(())
+        );
+        assert_eq!(packet, b"Q");
+        assert_eq!(packet.capacity(), capacity);
+        assert_eq!(packet.capacity(), MAX_PACKET);
+    }
+
+    #[test]
+    fn response_frames_use_one_write_and_handle_partial_writers() {
+        let mut complete = RecordingWriter {
+            bytes: Vec::new(),
+            calls: 0,
+            limit: usize::MAX,
+        };
+        write_packet(&mut complete, b'O', b"abc").unwrap();
+        assert_eq!(complete.calls, 1);
+        assert_eq!(complete.bytes, b"\0\0\0\x04Oabc");
+
+        let mut partial = RecordingWriter {
+            bytes: Vec::new(),
+            calls: 0,
+            limit: 2,
+        };
+        write_status(&mut partial, b'c').unwrap();
+        assert!(partial.calls > 1);
+        assert_eq!(partial.bytes, b"\0\0\0\x01c");
+    }
+
+    #[test]
+    fn listener_readiness_wakes_for_backlog_without_polling_delay() {
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        tcp.set_nonblocking(true).unwrap();
+        let address = tcp.local_addr().unwrap();
+        let listener = Listener::Tcp(tcp);
+        assert!(!listener.wait_readable(Duration::from_millis(1)).unwrap());
+        let first = TcpStream::connect(address).unwrap();
+        let second = TcpStream::connect(address).unwrap();
+        let started = Instant::now();
+        assert!(listener.wait_readable(Duration::from_millis(100)).unwrap());
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert!(listener.accept().is_ok());
+        assert!(listener.wait_readable(Duration::from_millis(100)).unwrap());
+        assert!(listener.accept().is_ok());
+        drop((first, second));
     }
 
     #[test]
@@ -537,6 +736,145 @@ mod tests {
 
         write_packet(&mut client, b'Q', &[]).unwrap();
         handle.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn negotiates_no_reply_flags_and_still_replies_at_eom() {
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let config = Arc::new(RuntimeConfig {
+            domain: "example.com".into(),
+            selector: "test".into(),
+            private_key: PathBuf::from("unused"),
+            listen: ListenAddr::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8891)),
+            require_fips: false,
+            key: Arc::new(key),
+        });
+        let active = Arc::new(RwLock::new(config));
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let handle = thread::spawn(move || {
+            handle_connection(Connection::Unix(server), &active).unwrap();
+        });
+
+        let mut options = Vec::new();
+        options.extend_from_slice(&6u32.to_be_bytes());
+        options.extend_from_slice(&ACTION_ADD_HEADER.to_be_bytes());
+        options.extend_from_slice(&SUPPORTED_NO_REPLY.to_be_bytes());
+        write_packet(&mut client, b'O', &options).unwrap();
+        let negotiation = read_packet(&mut client).unwrap().unwrap();
+        assert_eq!(
+            u32::from_be_bytes(negotiation[9..13].try_into().unwrap()),
+            SUPPORTED_NO_REPLY
+        );
+
+        for (command, payload) in [
+            (b'C', b"localhost\0".as_slice()),
+            (b'H', b"localhost\0".as_slice()),
+            (b'U', b"unknown\0".as_slice()),
+            (b'M', b"<alice@example.com>\0".as_slice()),
+            (b'R', b"<bob@example.net>\0".as_slice()),
+            (b'T', b"".as_slice()),
+            (b'L', b"From\0alice@example.com\0".as_slice()),
+            (b'N', b"".as_slice()),
+            (b'B', b"body\r\n".as_slice()),
+        ] {
+            write_packet(&mut client, command, payload).unwrap();
+        }
+        write_packet(&mut client, b'E', &[]).unwrap();
+        assert_eq!(read_packet(&mut client).unwrap().unwrap()[0], b'h');
+        assert_eq!(read_packet(&mut client).unwrap().unwrap(), vec![b'a']);
+        write_packet(&mut client, b'Q', &[]).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_reply_malformed_message_fails_open_and_connection_is_reusable() {
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let config = Arc::new(RuntimeConfig {
+            domain: "example.com".into(),
+            selector: "test".into(),
+            private_key: PathBuf::from("unused"),
+            listen: ListenAddr::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8891)),
+            require_fips: false,
+            key: Arc::new(key),
+        });
+        let active = Arc::new(RwLock::new(config));
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let handle = thread::spawn(move || {
+            handle_connection(Connection::Unix(server), &active).unwrap();
+        });
+
+        let mut options = Vec::new();
+        options.extend_from_slice(&6u32.to_be_bytes());
+        options.extend_from_slice(&ACTION_ADD_HEADER.to_be_bytes());
+        options.extend_from_slice(&SUPPORTED_NO_REPLY.to_be_bytes());
+        write_packet(&mut client, b'O', &options).unwrap();
+        assert_eq!(read_packet(&mut client).unwrap().unwrap()[0], b'O');
+
+        write_packet(&mut client, b'M', b"<alice@example.com>\0").unwrap();
+        write_packet(&mut client, b'L', b"malformed-without-nuls").unwrap();
+        write_packet(&mut client, b'B', b"body\r\n").unwrap();
+        write_packet(&mut client, b'E', &[]).unwrap();
+        assert_eq!(read_packet(&mut client).unwrap().unwrap(), vec![b'a']);
+
+        write_packet(&mut client, b'M', b"<alice@example.com>\0").unwrap();
+        write_packet(&mut client, b'L', b"From\0alice@example.com\0").unwrap();
+        write_packet(&mut client, b'B', b"body\r\n").unwrap();
+        write_packet(&mut client, b'E', &[]).unwrap();
+        assert_eq!(read_packet(&mut client).unwrap().unwrap()[0], b'h');
+        assert_eq!(read_packet(&mut client).unwrap().unwrap(), vec![b'a']);
+
+        write_packet(&mut client, b'Q', &[]).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn old_protocol_and_partial_offers_keep_required_replies() {
+        for (version, offered, expected) in [
+            (5u32, SUPPORTED_NO_REPLY, 0u32),
+            (6u32, PROTOCOL_NR_HEADER, PROTOCOL_NR_HEADER),
+        ] {
+            let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+            let config = Arc::new(RuntimeConfig {
+                domain: "example.com".into(),
+                selector: "test".into(),
+                private_key: PathBuf::from("unused"),
+                listen: ListenAddr::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8891)),
+                require_fips: false,
+                key: Arc::new(key),
+            });
+            let active = Arc::new(RwLock::new(config));
+            let (server, mut client) = UnixStream::pair().unwrap();
+            let handle = thread::spawn(move || {
+                handle_connection(Connection::Unix(server), &active).unwrap();
+            });
+            let mut options = Vec::new();
+            options.extend_from_slice(&version.to_be_bytes());
+            options.extend_from_slice(&ACTION_ADD_HEADER.to_be_bytes());
+            options.extend_from_slice(&offered.to_be_bytes());
+            write_packet(&mut client, b'O', &options).unwrap();
+            let negotiation = read_packet(&mut client).unwrap().unwrap();
+            assert_eq!(
+                u32::from_be_bytes(negotiation[9..13].try_into().unwrap()),
+                expected
+            );
+
+            write_packet(&mut client, b'M', b"<alice@example.com>\0").unwrap();
+            assert_eq!(read_packet(&mut client).unwrap().unwrap(), vec![b'c']);
+            write_packet(&mut client, b'L', b"From\0alice@example.com\0").unwrap();
+            if expected == 0 {
+                assert_eq!(read_packet(&mut client).unwrap().unwrap(), vec![b'c']);
+            }
+            write_packet(&mut client, b'B', b"body\r\n").unwrap();
+            assert_eq!(read_packet(&mut client).unwrap().unwrap(), vec![b'c']);
+            write_packet(&mut client, b'E', &[]).unwrap();
+            assert_eq!(read_packet(&mut client).unwrap().unwrap()[0], b'h');
+            assert_eq!(read_packet(&mut client).unwrap().unwrap(), vec![b'a']);
+            write_packet(&mut client, b'Q', &[]).unwrap();
+            handle.join().unwrap();
+        }
     }
 
     #[cfg(unix)]
