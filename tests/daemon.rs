@@ -134,8 +134,13 @@ fn unix_listener_reload_is_atomic_and_restartable() {
     packet(&mut stream, b'Q', &[]);
     drop(stream);
 
+    let shutdown_started = Instant::now();
     unsafe { libc::kill(daemon.child.id() as libc::pid_t, libc::SIGTERM) };
     assert!(daemon.child.wait().unwrap().success());
+    assert!(
+        shutdown_started.elapsed() < Duration::from_secs(2),
+        "daemon shutdown exceeded the bounded poll interval"
+    );
     daemon.child = Command::new(env!("CARGO_BIN_EXE_dkim-lite"))
         .args(["--config", config.to_str().unwrap()])
         .stdin(Stdio::null())
@@ -152,4 +157,17 @@ fn unix_listener_reload_is_atomic_and_restartable() {
         }
     }
     assert!(restarted.is_some());
+    let mut restarted = restarted.unwrap();
+    packet(&mut restarted, b'O', &options);
+    assert_eq!(response(&mut restarted)[0], b'O');
+    packet(&mut restarted, b'Q', &[]);
+    drop(restarted);
+
+    let shutdown_started = Instant::now();
+    unsafe { libc::kill(daemon.child.id() as libc::pid_t, libc::SIGTERM) };
+    assert!(daemon.child.wait().unwrap().success());
+    assert!(
+        shutdown_started.elapsed() < Duration::from_secs(2),
+        "restarted daemon shutdown exceeded the bounded poll interval"
+    );
 }
