@@ -28,3 +28,6 @@ operator-controlled `sshkey --username=dkim-test ...` entry to a private working
 before installing a guest. Never commit a VM password or private key.
 Completed qualification results and artifact digests are recorded in
 [`VALIDATION.md`](VALIDATION.md).
+
+The repeatable signing-only performance comparison and its Rspamd configuration
+are documented in [`BENCHMARK-RSPAMD.md`](BENCHMARK-RSPAMD.md).

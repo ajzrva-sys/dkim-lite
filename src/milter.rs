@@ -89,6 +89,9 @@ impl Connection {
         let timeout = Some(CONNECTION_TIMEOUT);
         match self {
             Self::Tcp(stream) => {
+                // Milter is a synchronous request/response protocol with many small
+                // packets.  Avoid delayed-ACK stalls on TCP listeners.
+                stream.set_nodelay(true)?;
                 stream.set_read_timeout(timeout)?;
                 stream.set_write_timeout(timeout)
             }
@@ -431,6 +434,21 @@ mod tests {
             read_packet(&mut reader).unwrap().unwrap(),
             vec![b'B', 1, 2, 3]
         );
+    }
+
+    #[test]
+    fn tcp_connections_disable_nagle_delays() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let connection = Connection::Tcp(server);
+        connection.set_timeouts().unwrap();
+        match connection {
+            Connection::Tcp(stream) => assert!(stream.nodelay().unwrap()),
+            #[cfg(unix)]
+            Connection::Unix(_) => unreachable!(),
+        }
+        drop(client);
     }
 
     #[test]
