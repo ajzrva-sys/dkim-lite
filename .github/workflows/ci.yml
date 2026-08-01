@@ -27,6 +27,6 @@ jobs:
           first="$(mktemp -d)"
           second="$(mktemp -d)"
           trap 'rm -rf "$first" "$second"' EXIT
-          packaging/make-source.sh 0.1.0 "$first" >/dev/null
-          packaging/make-source.sh 0.1.0 "$second" >/dev/null
-          cmp "$first/dkim-lite-0.1.0.tar.gz" "$second/dkim-lite-0.1.0.tar.gz"
+          packaging/make-source.sh 0.2.0 "$first" >/dev/null
+          packaging/make-source.sh 0.2.0 "$second" >/dev/null
+          cmp "$first/dkim-lite-0.2.0.tar.gz" "$second/dkim-lite-0.2.0.tar.gz"

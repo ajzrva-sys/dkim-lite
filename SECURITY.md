@@ -20,6 +20,12 @@ OpenSSL crate's bundled-source feature. `require_fips=true` is the default and
 requires both kernel and OpenSSL FIPS state; setting it false is an explicit
 operator decision for non-FIPS Linux systems.
 
+The `generate-key` command uses system OpenSSL EVP key generation, writes an
+unencrypted PKCS#8 key atomically with mode `0600`, and refuses replacement of
+an existing pathname. Its output contains only the destination path and public
+DNS material. Operators remain responsible for private-key ownership, secure
+staging-file removal, DNS publication, and rotation.
+
 Report vulnerabilities through this repository's private GitHub vulnerability
 reporting flow: open the **Security** tab, select **Advisories**, then select
 **Report a vulnerability**. If that control is unavailable, open a public issue

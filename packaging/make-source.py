@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 import tarfile
 
-VERSION = sys.argv[1] if len(sys.argv) > 1 else "0.1.0"
+VERSION = sys.argv[1] if len(sys.argv) > 1 else "0.2.0"
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else ROOT / "dist"
 PREFIX = f"dkim-lite-{VERSION}"

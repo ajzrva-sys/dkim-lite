@@ -29,6 +29,24 @@ dependencies on a connected development system after deliberately updating
 `Cargo.lock`, run `cargo vendor --locked vendor` and review the resulting source
 and checksums.
 
+## Generate a key
+
+Generate an unencrypted PKCS#8 RSA key through the linked system OpenSSL library:
+
+```sh
+dkim-lite generate-key \
+  --domain example.com \
+  --selector mail2026 \
+  --private-key /root/mail2026.pem
+```
+
+RSA 2048 bits is the default; `--bits 3072` and `--bits 4096` are also supported.
+Generation enforces the system FIPS state by default. On a deliberately non-FIPS
+Linux system, add `--require-fips false`. The command creates the private key
+atomically with mode `0600`, refuses to overwrite any existing path, and prints
+the public DNS TXT record. It does not edit configuration, publish DNS, change
+ownership, or reload the daemon.
+
 ## Configure
 
 ```ini
@@ -44,7 +62,7 @@ optional and defaults to `true`; when enabled, both the Linux kernel and system
 OpenSSL must report active FIPS mode. Set it to `false` explicitly for a non-FIPS
 Linux deployment. The TCP alternative is a numeric loopback
 address such as `tcp:127.0.0.1:8891`. The domain and selector are lowercased. The
-key must be an unencrypted 2048- or 4096-bit RSA PEM/PKCS#8 private key.
+key must be an unencrypted 2048–4096-bit RSA PEM/PKCS#8 private key.
 
 Install the key so only the signer account can read it:
 
@@ -106,7 +124,7 @@ contains framing, header, and body targets and has its own vendor bundle.
 
 ## RPM and operations
 
-Create `dkim-lite-0.1.0.tar.gz` with the crate root—including `vendor/`—as its top
+Create `dkim-lite-0.2.0.tar.gz` with the crate root—including `vendor/`—as its top
 directory and build `packaging/dkim-lite.spec` independently inside clean RHEL 8,
 9, and 10 build roots. The resulting RPM links to each release's system OpenSSL and
 glibc. Always build with networking disabled to enforce offline reproducibility.

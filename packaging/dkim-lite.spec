@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           dkim-lite
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Small outgoing-only DKIM milter
 License:        ASL 2.0
@@ -75,5 +75,8 @@ fi
 %{_datadir}/selinux/packages/dkim-lite/dkim_lite.pp
 
 %changelog
+* Fri Jul 31 2026 DKIM Lite Maintainers - 0.2.0-1
+- Add system-OpenSSL RSA key generation and DNS record output
+
 * Fri Jul 31 2026 DKIM Lite Maintainers - 0.1.0-1
 - Initial package

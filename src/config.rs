@@ -98,7 +98,7 @@ impl RuntimeConfig {
     }
 }
 
-fn validate_key(key: &PKey<Private>) -> Result<(), String> {
+pub(crate) fn validate_key(key: &PKey<Private>) -> Result<(), String> {
     let rsa: Rsa<Private> = key
         .rsa()
         .map_err(|_| "private key must be RSA".to_owned())?;
@@ -123,7 +123,7 @@ fn validate_key(key: &PKey<Private>) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_dns_name(kind: &str, value: &str) -> Result<String, String> {
+pub(crate) fn validate_dns_name(kind: &str, value: &str) -> Result<String, String> {
     let value = value.trim_end_matches('.').to_ascii_lowercase();
     if value.is_empty()
         || value.len() > 253

@@ -2,24 +2,29 @@
 
 ## DNS and keys
 
-Generate an unencrypted RSA key on the target FIPS host so system OpenSSL applies
-the active policy:
+Generate an unencrypted RSA key on the target FIPS host. `dkim-lite` uses the
+same system OpenSSL library and active provider policy as the signer, creates the
+file atomically with mode `0600`, and prints the ready-to-publish DNS record:
 
 ```sh
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out mail2026.pem
-openssl pkey -in mail2026.pem -pubout -outform DER |
-  openssl base64 -A
+dkim-lite generate-key \
+  --domain example.com \
+  --selector mail2026 \
+  --private-key /root/mail2026.pem
 ```
 
-Publish the base64 SubjectPublicKeyInfo at
-`mail2026._domainkey.example.com`:
+The default is RSA 2048; use `--bits 3072` or `--bits 4096` when required. Key
+generation requires FIPS by default. `--require-fips false` is an explicit
+operator override for non-FIPS Linux hosts. The output is a zone-file record
+whose adjacent quoted strings form one TXT value, for example:
 
 ```dns
 mail2026._domainkey.example.com. IN TXT "v=DKIM1; k=rsa; p=BASE64_PUBLIC_KEY"
 ```
 
-Install the private key with mode `0600`, owned by `dkim-lite`. Never place it
-in the RPM or source archive.
+The command refuses to overwrite an existing path. Install the resulting private
+key with mode `0600`, owned by `dkim-lite`, then securely remove the staging copy.
+Never place a private key in the RPM, source archive, shell history, or logs.
 
 ## Rotation
 
