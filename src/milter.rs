@@ -152,7 +152,7 @@ pub fn serve(
         }));
     }
 
-    'accept: while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+    while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
         if !listener
             .wait_readable(Duration::from_millis(100))
             .map_err(|error| format!("listener readiness failed: {error}"))?
@@ -162,29 +162,45 @@ pub fn serve(
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-        loop {
-            match listener.accept() {
-                Ok(connection) => {
-                    if sender.try_send(connection).is_err() {
-                        eprintln!("dkim-lite: worker queue full; dropping milter connection");
-                    }
-                    if !listener
-                        .wait_readable(Duration::ZERO)
-                        .map_err(|error| format!("listener readiness failed: {error}"))?
-                    {
-                        break;
-                    }
+        drain_backlog(
+            &shutdown,
+            || {
+                let connection = listener.accept()?;
+                if sender.try_send(connection).is_err() {
+                    eprintln!("dkim-lite: worker queue full; dropping milter connection");
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) if shutdown.load(std::sync::atomic::Ordering::Relaxed) => break 'accept,
-                Err(error) => return Err(format!("listener failed: {error}")),
-            }
-        }
+                Ok(())
+            },
+            || listener.wait_readable(Duration::ZERO),
+        )?;
     }
     drop(sender);
     for worker in worker_handles {
         if worker.join().is_err() {
             return Err("milter worker thread panicked".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn drain_backlog(
+    shutdown: &std::sync::atomic::AtomicBool,
+    mut accept: impl FnMut() -> io::Result<()>,
+    mut wait_readable: impl FnMut() -> io::Result<bool>,
+) -> Result<(), String> {
+    // A continuously readable backlog must not postpone shutdown indefinitely.
+    while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        match accept() {
+            Ok(()) => {
+                if !wait_readable()
+                    .map_err(|error| format!("listener readiness failed: {error}"))?
+                {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(_) if shutdown.load(std::sync::atomic::Ordering::Relaxed) => break,
+            Err(error) => return Err(format!("listener failed: {error}")),
         }
     }
     Ok(())
@@ -547,6 +563,44 @@ mod tests {
         bytes: Vec<u8>,
         calls: usize,
         limit: usize,
+    }
+
+    #[test]
+    fn backlog_drain_stops_after_shutdown_with_continuous_readiness() {
+        use std::cell::Cell;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Trigger shutdown at both successful-accept and readiness boundaries.
+        // Readiness never clears, so another accept must be prevented by shutdown.
+        for shutdown_in_accept in [true, false] {
+            let shutdown = AtomicBool::new(false);
+            let accepts = Cell::new(0);
+            drain_backlog(
+                &shutdown,
+                || {
+                    accepts.set(accepts.get() + 1);
+                    assert_eq!(accepts.get(), 1, "accepted again after shutdown");
+                    if shutdown_in_accept {
+                        shutdown.store(true, Ordering::Relaxed);
+                    }
+                    Ok(())
+                },
+                || {
+                    shutdown.store(true, Ordering::Relaxed);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            assert_eq!(accepts.get(), 1);
+        }
+
+        let shutdown = AtomicBool::new(true);
+        drain_backlog(
+            &shutdown,
+            || panic!("accepted with shutdown already set"),
+            || panic!("polled with shutdown already set"),
+        )
+        .unwrap();
     }
 
     impl Write for RecordingWriter {
