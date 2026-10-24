@@ -131,6 +131,39 @@ fn unix_listener_reload_is_atomic_and_restartable() {
 
     begin(&mut stream);
     assert!(finish(&mut stream).contains("s=two;"));
+
+    packet(&mut stream, b'M', b"<alice@example.com>\0");
+    assert_eq!(response(&mut stream), vec![b'c']);
+    header(
+        &mut stream,
+        b"From",
+        b"attacker@other.test (note <user@example.com>)",
+    );
+    packet(&mut stream, b'E', &[]);
+    // Ineligible mail is accepted unchanged, with no signature action first.
+    assert_eq!(response(&mut stream), vec![b'a']);
+
+    packet(&mut stream, b'M', b"<alice@example.com>\0");
+    assert_eq!(response(&mut stream), vec![b'c']);
+    header(
+        &mut stream,
+        b"From",
+        b"alice@example.com (note <other@other.test>)",
+    );
+    assert!(finish(&mut stream).contains("s=two;"));
+
+    if dkim_lite::config::check_fips_environment(true).is_err() {
+        write_config(&config, &socket, &key1, "rejected");
+        let required = fs::read_to_string(&config)
+            .unwrap()
+            .replace("require_fips=false", "require_fips=true");
+        fs::write(&config, required).unwrap();
+        unsafe { libc::kill(daemon.child.id() as libc::pid_t, libc::SIGHUP) };
+        thread::sleep(Duration::from_millis(300));
+        begin(&mut stream);
+        assert!(finish(&mut stream).contains("s=two;"));
+        write_config(&config, &socket, &key2, "two");
+    }
     packet(&mut stream, b'Q', &[]);
     drop(stream);
 
