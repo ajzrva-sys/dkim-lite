@@ -580,35 +580,48 @@ mod tests {
             sender.send(result).unwrap();
         });
         peer.write_all(prefix).unwrap();
-        // Supply extra fragments while the frame is still incomplete. Each read
-        // must retain the original deadline instead of receiving a fresh timeout.
-        let mut outcome = None;
-        for _ in 0..2 {
-            match receiver.recv_timeout(Duration::from_millis(100)) {
-                Ok(result) => {
-                    outcome = Some(result);
-                    break;
-                }
+        // Keep trickling data for the entire outer window: a fresh 500ms timeout
+        // on every read would never expire. Complete a fragmented length prefix
+        // as 1024 bytes, then leave its payload incomplete throughout the test.
+        let mut remaining_prefix = [0, 4, 0].into_iter();
+        let outer_deadline = Instant::now() + Duration::from_secs(2);
+        let outcome = loop {
+            let remaining = outer_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break None;
+            }
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(result) => break Some(result),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if peer.write_all(&[0]).is_err() {
-                        break;
+                    let byte = if prefix.len() == 1 {
+                        remaining_prefix.next().unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    if peer.write_all(&[byte]).is_err() {
+                        break receiver
+                            .recv_timeout(outer_deadline.saturating_duration_since(Instant::now()))
+                            .ok();
                     }
                 }
-                Err(error) => panic!("deadline worker disconnected: {error}"),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break None,
             }
-        }
-        let outcome = outcome
-            .map(Ok)
-            .unwrap_or_else(|| receiver.recv_timeout(Duration::from_secs(2)));
+        };
         // Always release the worker before reporting a failed deadline assertion.
         close_peer(&peer);
         worker.join().unwrap();
-        assert!(outcome.expect("connection did not expire").is_err());
+        let error = outcome
+            .expect("connection did not expire")
+            .expect_err("incomplete frame should time out");
+        assert!(
+            error.contains("milter connection lifetime exceeded"),
+            "{error}"
+        );
     }
 
     #[test]
     fn fragmented_tcp_length_and_payload_expire() {
-        for prefix in [b"\0".as_slice(), b"\0\0\0\x10B".as_slice()] {
+        for prefix in [b"\0".as_slice(), b"\0\0\x04\0B".as_slice()] {
             let (connection, peer) = tcp_pair();
             fragmented_input_expires(connection, peer, prefix);
         }
@@ -617,7 +630,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn fragmented_unix_length_and_payload_expire() {
-        for prefix in [b"\0".as_slice(), b"\0\0\0\x10B".as_slice()] {
+        for prefix in [b"\0".as_slice(), b"\0\0\x04\0B".as_slice()] {
             let (connection, peer) = UnixStream::pair().unwrap();
             fragmented_input_expires(Connection::Unix(connection), Connection::Unix(peer), prefix);
         }
