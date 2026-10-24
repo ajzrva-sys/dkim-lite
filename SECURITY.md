@@ -18,7 +18,8 @@ support are outside version 1.
 The production build uses the platform OpenSSL library. It never enables the
 OpenSSL crate's bundled-source feature. `require_fips=true` is the default and
 requires both kernel and OpenSSL FIPS state; setting it false is an explicit
-operator decision for non-FIPS Linux systems.
+operator decision for non-FIPS systems. Missing or unverifiable status fails
+validation, including on unsupported platforms.
 
 The `generate-key` command uses system OpenSSL EVP key generation, writes an
 unencrypted PKCS#8 key atomically with mode `0600`, and refuses replacement of
