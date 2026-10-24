@@ -60,7 +60,10 @@ require_fips=true
 These settings and comments are the only accepted syntax. `require_fips` is
 optional and defaults to `true`; when enabled, both the Linux kernel and system
 OpenSSL must report active FIPS mode. Set it to `false` explicitly for a non-FIPS
-Linux deployment. The TCP alternative is a numeric loopback
+deployment, including development on unsupported platforms. Missing, unreadable,
+or invalid kernel FIPS status rejects startup, configuration checks, key
+generation, and reload when FIPS is required. A rejected reload retains the
+active configuration. The TCP alternative is a numeric loopback
 address such as `tcp:127.0.0.1:8891`. The domain and selector are lowercased. The
 key must be an unencrypted 2048–4096-bit RSA PEM/PKCS#8 private key.
 

@@ -85,6 +85,22 @@ impl Connection {
         }
     }
 
+    fn set_read_timeout(&self, timeout: Duration) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_read_timeout(Some(timeout)),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.set_read_timeout(Some(timeout)),
+        }
+    }
+
+    fn set_write_timeout(&self, timeout: Duration) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_write_timeout(Some(timeout)),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.set_write_timeout(Some(timeout)),
+        }
+    }
+
     fn set_timeouts(&self) -> io::Result<()> {
         let timeout = Some(CONNECTION_TIMEOUT);
         match self {
@@ -101,6 +117,53 @@ impl Connection {
                 stream.set_write_timeout(timeout)
             }
         }
+    }
+}
+
+// Socket timeouts apply to individual I/O calls. Recompute them for every
+// attempt, including retries made by read_exact/write_all, so fragmented input
+// and partial output cannot extend the worker's absolute connection deadline.
+struct DeadlineConnection {
+    connection: Connection,
+    deadline: Instant,
+}
+
+impl DeadlineConnection {
+    fn remaining(&self) -> io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "milter connection lifetime exceeded",
+                )
+            })
+    }
+}
+
+impl Read for DeadlineConnection {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.connection.set_read_timeout(self.remaining()?)?;
+        let result = self.connection.read(buf);
+        self.remaining()?;
+        result
+    }
+}
+
+impl Write for DeadlineConnection {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.connection.set_write_timeout(self.remaining()?)?;
+        let result = self.connection.write(buf);
+        self.remaining()?;
+        result
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.connection.set_write_timeout(self.remaining()?)?;
+        let result = self.connection.flush();
+        self.remaining()?;
+        result
     }
 }
 
@@ -224,16 +287,24 @@ impl Listener {
 }
 
 fn handle_connection(
-    mut stream: Connection,
+    stream: Connection,
     active: &Arc<RwLock<Arc<RuntimeConfig>>>,
 ) -> Result<(), String> {
+    handle_connection_until(stream, active, Instant::now() + CONNECTION_TIMEOUT)
+}
+
+fn handle_connection_until(
+    connection: Connection,
+    active: &Arc<RwLock<Arc<RuntimeConfig>>>,
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut stream = DeadlineConnection {
+        connection,
+        deadline,
+    };
     let mut state = MessageState::default();
     let mut actions = 0u32;
-    let deadline = Instant::now() + CONNECTION_TIMEOUT;
     loop {
-        if Instant::now() >= deadline {
-            return Err("milter connection lifetime exceeded".to_owned());
-        }
         let packet = match read_packet(&mut stream) {
             Ok(Some(packet)) => packet,
             Ok(None) => return Ok(()),
@@ -333,7 +404,7 @@ fn receive_header(state: &mut MessageState, payload: &[u8]) {
 }
 
 fn finish_message(
-    stream: &mut Connection,
+    stream: &mut impl Write,
     state: &mut MessageState,
     actions: u32,
 ) -> Result<(), String> {
@@ -425,6 +496,190 @@ mod tests {
     use openssl::rsa::Rsa;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
+
+    fn tcp_pair() -> (Connection, Connection) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let server = Connection::Tcp(server);
+        server.set_timeouts().unwrap();
+        (server, Connection::Tcp(client))
+    }
+
+    fn close_peer(connection: &Connection) {
+        let _ = match connection {
+            Connection::Tcp(stream) => stream.shutdown(std::net::Shutdown::Both),
+            #[cfg(unix)]
+            Connection::Unix(stream) => stream.shutdown(std::net::Shutdown::Both),
+        };
+    }
+
+    fn active_config() -> Arc<RwLock<Arc<RuntimeConfig>>> {
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        Arc::new(RwLock::new(Arc::new(RuntimeConfig {
+            domain: "example.com".into(),
+            selector: "test".into(),
+            private_key: PathBuf::from("unused"),
+            listen: ListenAddr::Tcp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8891)),
+            require_fips: false,
+            key: Arc::new(key),
+        })))
+    }
+
+    fn expired_operations_do_not_touch_socket(connection: Connection, mut peer: Connection) {
+        peer.write_all(b"queued input").unwrap();
+        let mut stream = DeadlineConnection {
+            connection,
+            deadline: Instant::now(),
+        };
+        assert_eq!(
+            stream.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            stream.write(b"output").unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(stream.flush().unwrap_err().kind(), io::ErrorKind::TimedOut);
+        // The expired read did not consume even already-buffered input.
+        let mut input = [0; 12];
+        stream.connection.read_exact(&mut input).unwrap();
+        assert_eq!(&input, b"queued input");
+        drop(stream);
+        // The expired write did not emit data.
+        let mut output = Vec::new();
+        peer.read_to_end(&mut output).unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn expired_tcp_operations_do_not_touch_socket() {
+        let (connection, peer) = tcp_pair();
+        expired_operations_do_not_touch_socket(connection, peer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_unix_operations_do_not_touch_socket() {
+        let (connection, peer) = UnixStream::pair().unwrap();
+        expired_operations_do_not_touch_socket(
+            Connection::Unix(connection),
+            Connection::Unix(peer),
+        );
+    }
+
+    fn fragmented_input_expires(connection: Connection, mut peer: Connection, prefix: &[u8]) {
+        let active = active_config();
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = handle_connection_until(
+                connection,
+                &active,
+                Instant::now() + Duration::from_millis(500),
+            );
+            sender.send(result).unwrap();
+        });
+        peer.write_all(prefix).unwrap();
+        // Keep trickling data for the entire outer window: a fresh 500ms timeout
+        // on every read would never expire. Complete a fragmented length prefix
+        // as 1024 bytes, then leave its payload incomplete throughout the test.
+        let mut remaining_prefix = [0, 4, 0].into_iter();
+        let outer_deadline = Instant::now() + Duration::from_secs(2);
+        let outcome = loop {
+            let remaining = outer_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break None;
+            }
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(result) => break Some(result),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let byte = if prefix.len() == 1 {
+                        remaining_prefix.next().unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    if peer.write_all(&[byte]).is_err() {
+                        break receiver
+                            .recv_timeout(outer_deadline.saturating_duration_since(Instant::now()))
+                            .ok();
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+            }
+        };
+        // Always release the worker before reporting a failed deadline assertion.
+        close_peer(&peer);
+        worker.join().unwrap();
+        let error = outcome
+            .expect("connection did not expire")
+            .expect_err("incomplete frame should time out");
+        assert!(
+            error.contains("milter connection lifetime exceeded"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn fragmented_tcp_length_and_payload_expire() {
+        for prefix in [b"\0".as_slice(), b"\0\0\x04\0B".as_slice()] {
+            let (connection, peer) = tcp_pair();
+            fragmented_input_expires(connection, peer, prefix);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fragmented_unix_length_and_payload_expire() {
+        for prefix in [b"\0".as_slice(), b"\0\0\x04\0B".as_slice()] {
+            let (connection, peer) = UnixStream::pair().unwrap();
+            fragmented_input_expires(Connection::Unix(connection), Connection::Unix(peer), prefix);
+        }
+    }
+
+    fn stalled_response_expires(connection: Connection, mut peer: Connection) {
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            // This exceeds the local socket buffers, so write_all must wait for a
+            // peer that has stopped reading after the response prefix.
+            let payload = vec![b'x'; 16 * 1024 * 1024];
+            let mut stream = DeadlineConnection {
+                connection,
+                deadline: Instant::now() + Duration::from_millis(500),
+            };
+            sender
+                .send(write_packet(&mut stream, b'h', &payload))
+                .unwrap();
+        });
+        peer.set_read_timeout(Duration::from_secs(2)).unwrap();
+        let mut prefix = [0; 5];
+        let prefix_result = peer.read_exact(&mut prefix);
+        let outcome = receiver.recv_timeout(Duration::from_secs(2));
+        let mut partial_payload = [0; 1];
+        let partial_result = if outcome.is_ok() {
+            peer.read(&mut partial_payload)
+        } else {
+            Ok(0)
+        };
+        close_peer(&peer);
+        worker.join().unwrap();
+        prefix_result.unwrap();
+        assert_eq!(prefix[4], b'h');
+        assert_eq!(partial_result.unwrap(), 1, "response made partial progress");
+        assert!(outcome.expect("response did not expire").is_err());
+    }
+
+    #[test]
+    fn stalled_tcp_response_expires_after_partial_output() {
+        let (connection, peer) = tcp_pair();
+        stalled_response_expires(connection, peer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_unix_response_expires_after_partial_output() {
+        let (connection, peer) = UnixStream::pair().unwrap();
+        stalled_response_expires(Connection::Unix(connection), Connection::Unix(peer));
+    }
 
     #[test]
     fn packet_reader_handles_partial_reads() {

@@ -164,13 +164,25 @@ fn parse_listen(value: &str) -> Result<ListenAddr, String> {
 }
 
 pub fn check_fips_environment(required: bool) -> Result<(), String> {
+    check_fips_environment_with(
+        required,
+        || fs::read_to_string("/proc/sys/crypto/fips_enabled"),
+        openssl_fips_enabled,
+    )
+}
+
+fn check_fips_environment_with(
+    required: bool,
+    read_kernel_status: impl FnOnce() -> io::Result<String>,
+    openssl_is_fips: impl FnOnce() -> bool,
+) -> Result<(), String> {
     if !required {
         return Ok(());
     }
     let path = Path::new("/proc/sys/crypto/fips_enabled");
-    match fs::read_to_string(path) {
+    match read_kernel_status() {
         Ok(value) if value.trim() == "1" => {
-            if openssl_fips_enabled() {
+            if openssl_is_fips() {
                 Ok(())
             } else {
                 Err("kernel FIPS mode is enabled but system OpenSSL is not in FIPS mode".to_owned())
@@ -183,7 +195,6 @@ pub fn check_fips_environment(required: bool) -> Result<(), String> {
             "unexpected FIPS status in {}: {value:?}",
             path.display()
         )),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("cannot inspect {}: {e}", path.display())),
     }
 }
@@ -235,6 +246,45 @@ mod tests {
     #[test]
     fn fips_can_be_explicitly_disabled() {
         assert!(check_fips_environment(false).is_ok());
+        assert!(check_fips_environment_with(
+            false,
+            || panic!("disabled FIPS validation must not read kernel status"),
+            || panic!("disabled FIPS validation must not query OpenSSL"),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn required_fips_rejects_unavailable_or_invalid_kernel_status() {
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::Other,
+        ] {
+            let error = check_fips_environment_with(
+                true,
+                || Err(io::Error::from(kind)),
+                || panic!("unavailable kernel status must not pass FIPS validation"),
+            )
+            .unwrap_err();
+            assert!(error.contains("cannot inspect /proc/sys/crypto/fips_enabled"));
+        }
+        for value in ["0", "", "2", "enabled", "1\n0"] {
+            assert!(check_fips_environment_with(
+                true,
+                || Ok(value.to_owned()),
+                || panic!("invalid or disabled kernel status must not query OpenSSL"),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn required_fips_needs_both_kernel_and_openssl_confirmation() {
+        assert!(check_fips_environment_with(true, || Ok("1\n".to_owned()), || true).is_ok());
+        let error = check_fips_environment_with(true, || Ok("1".to_owned()), || false).unwrap_err();
+        assert!(error.contains("system OpenSSL is not in FIPS mode"));
     }
 
     #[test]
