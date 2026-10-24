@@ -3,7 +3,43 @@
 Run on 2026-07-31 (America/New_York). These results are a focused engineering
 comparison, not a claim about Rspamd's normal full filtering workload.
 
-## Result
+## Optimization follow-up
+
+The transport and canonicalization optimizations were tested on the same Fedora
+host with the original message matrix. Each value remains the median of three
+complete trials.
+
+| Body | Concurrency | Before TCP | Optimized TCP | Improvement | Optimized median / p95 |
+|---:|---:|---:|---:|---:|---:|
+| 1 KiB | 1 | 1,940.71 msg/s | 3,074.51 msg/s | 58.4% | 0.304 / 0.375 ms |
+| 1 KiB | 8 | 3,160.44 msg/s | 6,082.64 msg/s | 92.5% | 1.197 / 2.056 ms |
+| 100 KiB | 1 | 699.94 msg/s | 1,189.68 msg/s | 70.0% | 0.820 / 0.905 ms |
+| 100 KiB | 8 | 1,921.98 msg/s | 3,916.25 msg/s | 103.8% | 1.851 / 2.802 ms |
+| 1 MiB | 1 | 110.44 msg/s | 209.31 msg/s | 89.5% | 4.787 / 4.956 ms |
+| 1 MiB | 8 | 369.73 msg/s | 762.01 msg/s | 106.1% | 10.271 / 11.125 ms |
+
+Fresh TCP connections, including connect, negotiation, signing, and final
+acceptance, had a median trial p95 of 0.485 ms for 1 KiB messages. This is well
+below the 10 ms acceptance limit and confirms that listener readiness no longer
+inherits the old 100 ms polling delay.
+
+Linux `perf` attributed 46.64% of baseline samples to `SHA256_Update`, consistent
+with one hash call per ordinary body byte. Bulk-span canonicalization reduced
+that share to 33.30%; SHA-256 block processing is now a larger part of the
+remaining work.
+
+An informational Unix-socket run produced median throughputs of 2,959.92,
+1,364.24, and 226.15 msg/s serially for 1 KiB, 100 KiB, and 1 MiB bodies. At
+concurrency 8 it produced 6,925.71, 4,117.49, and 793.86 msg/s. Unix was 4–15%
+faster in five scenarios and 3.7% slower for serial 1 KiB mail; these loopback
+results do not justify a universal performance claim.
+
+The optimized build also passed the full suite and system-OpenSSL linkage check
+on FIPS-enabled Rocky Linux 9. Postfix added valid signatures over both Unix and
+loopback TCP milter transports. OpenDKIM accepted the resulting 2048-bit
+signature, and Rspamd produced `R_DKIM_ALLOW` for the same message.
+
+## Initial Rspamd comparison
 
 Each value is the median of three complete trials. Latency percentiles are the
 median of the three trial-level percentiles.
@@ -90,9 +126,9 @@ Trial sizes were:
 | 100 KiB | 400 | 800 | 10 |
 | 1 MiB | 100 | 160 | 5 |
 
-The benchmark also exposed a TCP transport defect in `dkim-lite`: without
-`TCP_NODELAY`, synchronous milter command responses incurred delayed-ACK stalls.
-The daemon now enables it on accepted TCP sockets, with a regression test.
+The initial benchmark also exposed a TCP transport defect in `dkim-lite`:
+without `TCP_NODELAY`, synchronous milter command responses incurred delayed-ACK
+stalls. The daemon enables it on accepted TCP sockets, with a regression test.
 
 ## Caveats
 

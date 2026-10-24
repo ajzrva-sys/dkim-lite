@@ -1,5 +1,51 @@
 # Release validation record
 
+## PR #1 shutdown correction (2026-10-22)
+
+Baseline: `b459fd23c2f255ec8c58b76adcf6beb720f41e4f` on
+`agent/performance-optimization`. Issue #2 is corrected by checking shutdown
+before each backlog accept. The 100 ms readiness wait, zero-time backlog polls,
+bounded worker queue, connection processing, and signing implementation remain
+in place.
+
+Validation ran on macOS 26 / Darwin 25.6.0 arm64 with Rust 1.97.1. Final source
+SHA-256 identities, frozen before completion checks and independent review:
+
+```text
+b7f70bc279f57d8da42975daab0bd5258ee9fdc704f0d928561e4ec4dbd164e8  src/milter.rs
+548f504ed932bd86249ab9d1c193a4dfad20dea4e82fd02762928fb28144ef84  tests/daemon.rs
+```
+
+- The deterministic continuously-readable backlog test failed without the new
+  guard (`accepted again after shutdown`, second accept) and passed with it.
+  It covers shutdown during successful accept, during readiness, and at entry.
+- TCP and Unix daemon tests complete at least 128 Quit/EOF sessions, keep four
+  connection producers running until SIGTERM exit, require successful exit
+  within two seconds (including worker joins), verify client closure, then
+  restart and sign on the same endpoint. The ordinary lifecycle test now also
+  uses an actual timeout instead of checking elapsed time after blocking wait.
+- `cargo test --locked --offline`: passed, 35 tests; zero documentation tests.
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --all-targets --locked --offline -- -D warnings`: passed.
+- `cargo build --release --locked --offline`: passed; binary reports 0.2.0.
+- Two `packaging/make-source.sh 0.2.0` archives compared byte-identical, SHA-256
+  `e509dbceb631f294374326bc8f6e0e637cd7edbd3ebaf993b601ddff3a591f88`.
+- A separate reviewer found no concrete correctness issues and independently
+  passed the deterministic regression, all three daemon tests, and three
+  additional TCP/Unix churn repetitions (six test executions). The implementing
+  agent also passed the full daemon suite three consecutive times.
+
+Initial immediate-close and Quit-then-immediate-close Unix churn fixtures failed
+on macOS: configuring an accepted socket after its peer closed returned `EINVAL`,
+terminating the listener and causing a secondary client `BrokenPipe`. The final
+fixture retains the peer until the worker processes Quit and closes it. These
+failed attempts were retained; abort-before-accept behavior is not covered or
+changed by this shutdown correction.
+
+Linux/FIPS/RPM, Postfix, OpenDKIM/Rspamd, fuzzing, and performance qualification
+below are historical results, not rerun for this correction. The local Docker
+daemon was unavailable. No daemon was installed or production state changed.
+
 ## v0.1.0 qualification
 
 Qualification completed on 2026-07-31 in clean FIPS-enabled Rocky Linux

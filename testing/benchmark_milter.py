@@ -138,11 +138,31 @@ def make_body(size):
     return (line * repeats)[:size]
 
 
-def run_worker(host, port, body, count, worker_number, timeout):
-    timings = []
-    with socket.create_connection((host, port), timeout=timeout) as sock:
+def connect(endpoint, timeout):
+    if endpoint[0] == "unix":
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(timeout)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.connect(endpoint[1])
+        return sock
+    sock = socket.create_connection((endpoint[1], endpoint[2]), timeout=timeout)
+    sock.settimeout(timeout)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return sock
+
+
+def run_worker(endpoint, body, count, worker_number, timeout, fresh_connections):
+    timings = []
+    if fresh_connections:
+        for index in range(count):
+            started = time.perf_counter_ns()
+            with connect(endpoint, timeout) as sock:
+                protocol = negotiate(sock)
+                sign_message(sock, protocol, body, worker_number * 10_000_000 + index)
+                send_packet(sock, b"Q")
+            timings.append(time.perf_counter_ns() - started)
+        return timings
+
+    with connect(endpoint, timeout) as sock:
         protocol = negotiate(sock)
         for index in range(count):
             timings.append(
@@ -161,27 +181,43 @@ def percentile(values, percentage):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", required=True, type=int)
+    endpoint = parser.add_mutually_exclusive_group(required=True)
+    endpoint.add_argument("--port", type=int)
+    endpoint.add_argument("--unix-socket")
     parser.add_argument("--size", required=True, type=int)
     parser.add_argument("--messages", required=True, type=int)
     parser.add_argument("--concurrency", default=1, type=int)
     parser.add_argument("--warmup", default=10, type=int)
     parser.add_argument("--timeout", default=60.0, type=float)
     parser.add_argument("--label", required=True)
+    parser.add_argument("--fresh-connections", action="store_true")
     args = parser.parse_args()
     if args.messages < args.concurrency or args.concurrency < 1:
         parser.error("messages must be at least concurrency, and concurrency must be positive")
 
     body = make_body(args.size)
+    target = (
+        ("unix", args.unix_socket)
+        if args.unix_socket
+        else ("tcp", args.host, args.port)
+    )
     for index in range(args.warmup):
-        run_worker(args.host, args.port, body, 1, 900 + index, args.timeout)
+        run_worker(target, body, 1, 900 + index, args.timeout, args.fresh_connections)
 
     base, extra = divmod(args.messages, args.concurrency)
     counts = [base + (1 if index < extra else 0) for index in range(args.concurrency)]
     started = time.perf_counter_ns()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
         futures = [
-            executor.submit(run_worker, args.host, args.port, body, count, index, args.timeout)
+            executor.submit(
+                run_worker,
+                target,
+                body,
+                count,
+                index,
+                args.timeout,
+                args.fresh_connections,
+            )
             for index, count in enumerate(counts)
         ]
         timings = [item for future in futures for item in future.result()]
@@ -193,6 +229,8 @@ def main():
         "body_bytes": len(body),
         "messages": len(timings),
         "concurrency": args.concurrency,
+        "connection_mode": "fresh" if args.fresh_connections else "reused",
+        "transport": target[0],
         "wall_seconds": round(wall_ns / 1_000_000_000, 6),
         "messages_per_second": round(len(timings) * 1_000_000_000 / wall_ns, 2),
         "latency_ms_median": round(statistics.median(millis), 3),
